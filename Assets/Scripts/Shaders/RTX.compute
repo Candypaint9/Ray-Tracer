@@ -1,0 +1,233 @@
+#pragma kernel CSMain
+#include "UnityCG.cginc"
+
+RWTexture2D<float4> Result;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+int RaysPerPixel;
+int MaxBounces;
+int FrameNum;
+
+
+Texture2D _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+static const float PI = 3.14159265f;
+
+struct Ray
+{
+    float3 origin;
+    float3 dir;
+};
+
+
+struct RayTracingMaterial
+{
+    float4 color;
+    float4 emissionColor;
+    float emissionStrength;
+    float albedo;
+};
+
+struct HitInfo
+{
+    bool didHit;
+    float3 pos;
+    float3 normal;
+    float dist;
+    RayTracingMaterial material;
+};
+
+struct Sphere
+{
+    float3 pos;
+    float radius;
+    RayTracingMaterial material;
+};
+
+
+StructuredBuffer<Sphere> spheres;
+int NumSpheres;
+
+
+
+Ray CastRay(uint3 id, float2 screenDimensions)
+{
+    float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / screenDimensions * 2.0f - 1.0f);
+    
+    float3 origin = _WorldSpaceCameraPos;
+    
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    direction = normalize(mul(_CameraToWorld, float4(direction, 0.0f)).xyz);
+    
+    Ray ray;
+    ray.origin = origin;
+    ray.dir = direction;
+    return ray;
+}
+
+
+HitInfo RaySphereIntersection(Ray ray, Sphere sphere)
+{
+    HitInfo hitInfo = (HitInfo)0;
+    
+    float t = dot(ray.dir, sphere.pos - ray.origin);
+    float3 p = ray.origin + t * ray.dir;
+    
+    float y = length(sphere.pos - p);
+    
+    if (y > sphere.radius || dot(p - ray.origin, ray.dir) < 0)
+    {
+        return hitInfo;
+    }   
+
+    float x = sqrt(sphere.radius * sphere.radius - y * y);
+    float3 p1 = p - ray.dir * x;
+    float dist = length(p1 - ray.origin);
+       
+    hitInfo.didHit = true;
+    hitInfo.dist = dist;
+    hitInfo.material = sphere.material;
+    hitInfo.pos = p1;
+    hitInfo.normal = normalize(p1 - sphere.pos);
+
+
+    return hitInfo;   
+}
+
+
+HitInfo CalculateRayCollision(Ray ray)
+{
+    HitInfo closestHit = (HitInfo)0;
+    
+    closestHit.dist = 1.#INF;
+    
+    for (int i = 0; i < NumSpheres; i++)
+    {
+        HitInfo hitInfo = RaySphereIntersection(ray, spheres[i]);
+        
+        if(hitInfo.didHit && hitInfo.dist < closestHit.dist)
+        {
+            closestHit = hitInfo;
+        }
+    }
+        
+    return closestHit;
+}
+
+
+float GetRandomValue(inout uint state)
+{
+    state *= 79238493;
+    state += 2848212048;
+    uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277391029;
+    result = (result >> 22) ^ result;
+    return result / 4294967295.0;
+}
+
+
+float GetRandomValueNormalDistribution(inout uint state)
+{
+    float theta = 2 * 3.1415926 * GetRandomValue(state);
+    float rho = sqrt(-2 * log(GetRandomValue(state)));
+    return rho * cos(theta);
+}
+
+
+float3 GetRandomRayReflection(inout uint state)
+{
+    float x = GetRandomValueNormalDistribution(state);
+    float y = GetRandomValueNormalDistribution(state);
+    float z = GetRandomValueNormalDistribution(state);
+
+   return normalize(float3(x, y, z));
+}
+
+
+float3 GetEnvironmentLight(Ray ray)
+{
+    float theta = acos(ray.dir.y) / -PI;
+    float phi = atan2(ray.dir.x, -ray.dir.z) / -PI * 0.5f;
+    return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+}
+
+
+
+float3 Trace(Ray ray, inout uint state)
+{
+    float3 lightValue = 0; //to check if intersects with light source
+    float3 rayColor = 1; //start as white
+        
+    for (int bounceNum = 1; bounceNum <= MaxBounces; bounceNum++)
+    {
+        HitInfo hitInfo = CalculateRayCollision(ray);
+        
+        float3 emittedLight;
+
+        //later can add enviromnent/sky colors if it doesnt hit anything
+        if(!hitInfo.didHit)
+        {
+            lightValue += GetEnvironmentLight(ray) / (bounceNum * 3) * rayColor;
+            break;
+        }
+        
+        ray.origin = hitInfo.pos + hitInfo.normal * 0.001f;
+        
+        //for completely specular reflections
+        //ray.dir = reflect(ray.dir, hitInfo.normal);       
+        
+        //cosine weighted distribution
+        //ray.dir = normalize(hitInfo.normal + GetRandomRayReflection(state));
+        
+        //logical
+        /*float3 reflectedRay = GetRandomRayReflection(state);
+        if(dot(reflectedRay, ray.dir) < 0)
+        {
+            reflectedRay *= -1;
+        }
+        ray.dir = reflectedRay;*/
+        
+        float3 specular = reflect(ray.dir, hitInfo.normal);
+        float3 diffuse = normalize(hitInfo.normal + GetRandomRayReflection(state));
+        ray.dir = lerp(diffuse, specular, hitInfo.material.albedo);
+        
+        
+        RayTracingMaterial hitMaterial = hitInfo.material;
+        
+        emittedLight = hitMaterial.emissionColor * hitMaterial.emissionStrength;
+        lightValue += emittedLight * rayColor;
+        rayColor *= hitMaterial.color;
+    }
+    
+    return lightValue;
+}
+
+
+[numthreads(16,16,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Result.GetDimensions(width, height);
+    float2 screenDimensions = float2(width, height);
+            
+    float randomNumState = id.y * width + id.x + FrameNum * 298374;
+    float3 totalIncomingLight = 0;
+    
+    Ray ray = CastRay(id, screenDimensions);
+    
+    for (int i = 0; i < RaysPerPixel; i++)
+    {
+        float2 offset = float2(GetRandomValue(randomNumState), GetRandomValue(randomNumState));
+        offset = 0;
+        ray.origin += float3(offset / 4294967295.0f, 0);
+        
+        totalIncomingLight += Trace(ray, randomNumState);
+    }
+    
+    float3 pixelColor = totalIncomingLight / RaysPerPixel;
+    //pixelColor *= 1.5f;
+    
+    Result[id.xy] = float4(pixelColor, 1);
+    //Result[id.xy] = float4(CalculateRayCollision(ray).normal, 0);
+}
